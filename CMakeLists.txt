@@ -51,6 +51,10 @@ if(BUILD_TESTING)
   target_include_directories(test_global_event_id_provider PRIVATE src)
   target_link_libraries(test_global_event_id_provider ${PROJECT_NAME})
 
+  ament_add_gtest(test_scheduler test/test_scheduler.cpp)
+  target_include_directories(test_scheduler PRIVATE src)
+  target_link_libraries(test_scheduler ${PROJECT_NAME})
+
   ament_add_gtest(test_types test/test_types.cpp)
   target_link_libraries(test_types ${PROJECT_NAME})
 endif()
