@@ -12,6 +12,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 add_library(${PROJECT_NAME}
+  src/rcl_exec/detail/first_in_first_out_scheduler.cpp
   src/rcl_exec/detail/global_event_id_provider.cpp)
 target_include_directories(${PROJECT_NAME}
   PUBLIC

@@ -11,17 +11,19 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#include "first_in_first_out_scheduler.hpp"
+#include "rcl_exec/detail/first_in_first_out_scheduler.hpp"
+
+#include <functional>
+#include <memory>
+#include <optional>
 #include <utility>
 
-namespace rclcpp
+namespace rcl_exec
 {
-namespace executors
-{
-namespace cbg_executor
+namespace detail
 {
 std::function<void(size_t)> FirstInFirstOutCallbackGroupHandle::get_ready_callback_for_entity(
-  const rclcpp::SubscriptionBase::WeakPtr & entity)
+  const CBGScheduler::WeakEntityHandle & entity)
 {
   return [weak_ptr = entity, this](size_t nr_msg) {
            add_ready_entity([&] () {
@@ -33,7 +35,7 @@ std::function<void(size_t)> FirstInFirstOutCallbackGroupHandle::get_ready_callba
 }
 
 std::function<void(std::function<void()> executed_callback)> FirstInFirstOutCallbackGroupHandle::
-get_ready_callback_for_entity(const rclcpp::TimerBase::WeakPtr & entity)
+get_ready_callback_for_timer(const CBGScheduler::WeakEntityHandle & entity)
 {
   return [weak_ptr = entity, this](std::function<void()> executed_callback) {
            add_ready_entity([&] () {
@@ -43,33 +45,9 @@ get_ready_callback_for_entity(const rclcpp::TimerBase::WeakPtr & entity)
          };
 }
 
-std::function<void(size_t)> FirstInFirstOutCallbackGroupHandle::get_ready_callback_for_entity(
-  const rclcpp::ClientBase::WeakPtr & entity)
-{
-  return [weak_ptr = entity, this](size_t nr_msg) {
-           add_ready_entity([&] () {
-               for (size_t i = 0; i < nr_msg; i++) {
-                 ready_entities.emplace_back(weak_ptr);
-               }
-            });
-         };
-}
-
-std::function<void(size_t)> FirstInFirstOutCallbackGroupHandle::get_ready_callback_for_entity(
-  const rclcpp::ServiceBase::WeakPtr & entity)
-{
-  return [weak_ptr = entity, this](size_t nr_msg) {
-           add_ready_entity([&] () {
-               for (size_t i = 0; i < nr_msg; i++) {
-                 ready_entities.emplace_back(weak_ptr);
-               }
-            });
-         };
-}
-
 std::function<void(size_t,
-  int)> FirstInFirstOutCallbackGroupHandle::get_ready_callback_for_entity(
-  const rclcpp::Waitable::WeakPtr & entity)
+  int)> FirstInFirstOutCallbackGroupHandle::get_ready_callback_for_waitable(
+  const CBGScheduler::WeakEntityHandle & entity)
 {
   return [weak_ptr = entity, this](size_t nr_msg, int event_type) {
            add_ready_entity([&] () {
@@ -100,7 +78,7 @@ get_next_ready_entity()
   while(!ready_entities.empty()) {
     auto & first = ready_entities.front();
 
-    std::function<void()> exec_fun = first.get_execute_function();
+    std::function<void()> exec_fun = first.get_execute_function(dispatcher);
     ready_entities.pop_front();
     if(!exec_fun) {
       // was deleted, or in case of timer was canceled
@@ -128,7 +106,7 @@ get_next_ready_entity(GlobalEventIdProvider::MonotonicId max_id)
       return std::nullopt;
     }
 
-    std::function<void()> exec_fun = first.get_execute_function();
+    std::function<void()> exec_fun = first.get_execute_function(dispatcher);
     ready_entities.pop_front();
     if(!exec_fun) {
       // was deleted, or in case of timer was canceled
@@ -147,9 +125,10 @@ get_next_ready_entity(GlobalEventIdProvider::MonotonicId max_id)
 
 std::unique_ptr<FirstInFirstOutScheduler::CallbackGroupHandle>
 FirstInFirstOutScheduler::get_handle_for_callback_group(
-  const rclcpp::CallbackGroup::SharedPtr & callback_group)
+  CallbackGroupType callback_group_type)
 {
-  return std::make_unique<FirstInFirstOutCallbackGroupHandle>(*this, callback_group->type());
+  return std::make_unique<FirstInFirstOutCallbackGroupHandle>(
+    *this, callback_group_type, dispatcher);
 }
 
 CBGScheduler::ExecutableEntityWithInfo FirstInFirstOutScheduler::get_next_ready_entity_intern()
@@ -207,6 +186,5 @@ CBGScheduler::ExecutableEntityWithInfo FirstInFirstOutScheduler::get_next_ready_
   return CBGScheduler::ExecutableEntityWithInfo{.entity = std::nullopt,
     .moreEntitiesReady = false};
 }
-}  // namespace cbg_executor
-}  // namespace executors
-}  // namespace rclcpp
+}  // namespace detail
+}  // namespace rcl_exec

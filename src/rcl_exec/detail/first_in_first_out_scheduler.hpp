@@ -12,41 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#pragma once
+#ifndef RCL_EXEC__DETAIL__FIRST_IN_FIRST_OUT_SCHEDULER_HPP_
+#define RCL_EXEC__DETAIL__FIRST_IN_FIRST_OUT_SCHEDULER_HPP_
 
+#include <cstddef>
 #include <deque>
+#include <functional>
 #include <memory>
-
+#include <optional>
+#include <utility>
 #include <vector>
 
-#include "ready_entity.hpp"
-#include "scheduler.hpp"
-#include "global_event_id_provider.hpp"
+#include "rcl_exec/entity_dispatcher.hpp"
+#include "rcl_exec/types.hpp"
+#include "rcl_exec/detail/ready_entity.hpp"
+#include "rcl_exec/detail/scheduler.hpp"
+#include "rcl_exec/detail/global_event_id_provider.hpp"
 
-namespace rclcpp
+namespace rcl_exec
 {
-namespace executors
-{
-namespace cbg_executor
+namespace detail
 {
 struct FirstInFirstOutCallbackGroupHandle final : public CBGScheduler::CallbackGroupHandle
 {
 public:
-  explicit FirstInFirstOutCallbackGroupHandle(CBGScheduler & scheduler, CallbackGroupType type)
-  : CallbackGroupHandle(scheduler, type)
+  FirstInFirstOutCallbackGroupHandle(
+    CBGScheduler & scheduler, CallbackGroupType type, EntityDispatcher & dispatcher)
+  : CallbackGroupHandle(scheduler, type), dispatcher(dispatcher)
   {
   }
 
   std::function<void(size_t)> get_ready_callback_for_entity(
-    const rclcpp::SubscriptionBase::WeakPtr & entity) final;
-  std::function<void(std::function<void()> executed_callback)> get_ready_callback_for_entity(
-    const rclcpp::TimerBase::WeakPtr & entity) final;
-  std::function<void(size_t)> get_ready_callback_for_entity(
-    const rclcpp::ClientBase::WeakPtr & entity) final;
-  std::function<void(size_t)> get_ready_callback_for_entity(
-    const rclcpp::ServiceBase::WeakPtr & entity) final;
+    const CBGScheduler::WeakEntityHandle & entity) final;
+  std::function<void(std::function<void()> executed_callback)> get_ready_callback_for_timer(
+    const CBGScheduler::WeakEntityHandle & timer) final;
   std::function<void(size_t,
-    int)> get_ready_callback_for_entity(const rclcpp::Waitable::WeakPtr & entity) final;
+    int)> get_ready_callback_for_waitable(const CBGScheduler::WeakEntityHandle & waitable) final;
   std::function<void(size_t)> get_ready_callback_for_entity(
     const CBGScheduler::CallbackEventType & entity) final;
 
@@ -60,13 +61,17 @@ public:
   }
 
 private:
+  EntityDispatcher & dispatcher;
   std::deque<ReadyEntity> ready_entities;
 };
 
 class FirstInFirstOutScheduler : public CBGScheduler
 {
 public:
-  using CBGScheduler::CBGScheduler;
+  FirstInFirstOutScheduler(EntityDispatcher & dispatcher, std::function<void()> sync_function)
+  : CBGScheduler(std::move(sync_function)), dispatcher(dispatcher)
+  {
+  }
 
 private:
   ExecutableEntityWithInfo get_next_ready_entity_intern() final;
@@ -74,10 +79,13 @@ private:
     GlobalEventIdProvider::MonotonicId max_id) final;
 
   std::unique_ptr<CallbackGroupHandle> get_handle_for_callback_group(
-    const rclcpp::CallbackGroup::SharedPtr & callback_group) final;
+    CallbackGroupType callback_group_type) final;
+
+  EntityDispatcher & dispatcher;
 
   std::vector<std::unique_ptr<FirstInFirstOutCallbackGroupHandle>> callback_group_handles;
 };
-}  // namespace cbg_executor
-}  // namespace executors
-}  // namespace rclcpp
+}  // namespace detail
+}  // namespace rcl_exec
+
+#endif  // RCL_EXEC__DETAIL__FIRST_IN_FIRST_OUT_SCHEDULER_HPP_
