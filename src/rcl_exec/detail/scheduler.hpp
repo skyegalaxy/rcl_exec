@@ -19,15 +19,17 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
 
-#include <rclcpp/callback_group.hpp>
-#include "global_event_id_provider.hpp"
+#include "rcl_exec/types.hpp"
+#include "rcl_exec/detail/global_event_id_provider.hpp"
 
 namespace rcl_exec
 {
@@ -161,13 +163,28 @@ struct WorkerQueue
     return cpy;
   }
 };
-
 class CBGScheduler
 {
 public:
+  /// An entity handle plus the client library's liveness token for it.
+  /**
+   * The engine never extends an entity's lifetime: once the token has expired, the entity is
+   * skipped without touching its handle.
+   */
+  struct WeakEntityHandle
+  {
+    EntityHandle handle;
+    std::weak_ptr<const void> liveness;
+
+    bool expired() const
+    {
+      return liveness.expired();
+    }
+  };
+
   struct WaitableWithEventType
   {
-    rclcpp::Waitable::WeakPtr waitable;
+    WeakEntityHandle waitable;
     int internal_event_type;
 
     bool expired() const
@@ -206,16 +223,13 @@ public:
     CallbackGroupHandle & operator=(const CallbackGroupHandle &) = delete;
     CallbackGroupHandle & operator=(CallbackGroupHandle &&) = delete;
 
+    /// Ready callback for a subscription, service, client or guard condition.
     virtual std::function<void(size_t)> get_ready_callback_for_entity(
-      const rclcpp::SubscriptionBase::WeakPtr & entity) = 0;
+      const WeakEntityHandle & entity) = 0;
     virtual std::function<void(std::function<void()> executed_callback)>
-    get_ready_callback_for_entity(const rclcpp::TimerBase::WeakPtr & entity) = 0;
-    virtual std::function<void(size_t)> get_ready_callback_for_entity(
-      const rclcpp::ClientBase::WeakPtr & entity) = 0;
-    virtual std::function<void(size_t)> get_ready_callback_for_entity(
-      const rclcpp::ServiceBase::WeakPtr & entity) = 0;
+    get_ready_callback_for_timer(const WeakEntityHandle & timer) = 0;
     virtual std::function<void(size_t,
-      int)> get_ready_callback_for_entity(const rclcpp::Waitable::WeakPtr & entity) = 0;
+      int)> get_ready_callback_for_waitable(const WeakEntityHandle & waitable) = 0;
     virtual std::function<void(size_t)> get_ready_callback_for_entity(
       const CallbackEventType & entity) = 0;
 
@@ -238,8 +252,6 @@ public:
     }
 
     CallbackGroupType get_type() {return type;}
-
-    bool is_ready();
 
     // true if this cbg is inside the scheduler's queue
     bool in_queue = false;
@@ -334,9 +346,9 @@ private:
   CBGScheduler & operator=(const CBGScheduler &) = delete;
   CBGScheduler & operator=(CBGScheduler &&) = delete;
 
-  CallbackGroupHandle * add_callback_group(const rclcpp::CallbackGroup::SharedPtr & callback_group)
+  CallbackGroupHandle * add_callback_group(CallbackGroupType callback_group_type)
   {
-    auto uPtr = get_handle_for_callback_group(callback_group);
+    auto uPtr = get_handle_for_callback_group(callback_group_type);
     CallbackGroupHandle * ret = uPtr.get();
 
     std::lock_guard lk(ready_callback_groups_mutex);
@@ -541,7 +553,7 @@ private:
 
 protected:
   virtual std::unique_ptr<CallbackGroupHandle> get_handle_for_callback_group(
-    const rclcpp::CallbackGroup::SharedPtr & callback_group) = 0;
+    CallbackGroupType callback_group_type) = 0;
 
   /**
    * Returns true if the worker was enqueued and shall block.
