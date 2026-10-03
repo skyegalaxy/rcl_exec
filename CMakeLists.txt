@@ -48,6 +48,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_entity_dispatcher test/test_entity_dispatcher.cpp)
   target_link_libraries(test_entity_dispatcher ${PROJECT_NAME})
 
+  ament_add_gtest(test_first_in_first_out_scheduler test/test_first_in_first_out_scheduler.cpp)
+  target_include_directories(test_first_in_first_out_scheduler PRIVATE src)
+  target_link_libraries(test_first_in_first_out_scheduler ${PROJECT_NAME})
+
   ament_add_gtest(test_global_event_id_provider test/test_global_event_id_provider.cpp)
   target_include_directories(test_global_event_id_provider PRIVATE src)
   target_link_libraries(test_global_event_id_provider ${PROJECT_NAME})
