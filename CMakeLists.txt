@@ -31,6 +31,9 @@ if(BUILD_TESTING)
 
   find_package(ament_cmake_gtest REQUIRED)
 
+  ament_add_gtest(test_entity_dispatcher test/test_entity_dispatcher.cpp)
+  target_link_libraries(test_entity_dispatcher ${PROJECT_NAME})
+
   ament_add_gtest(test_types test/test_types.cpp)
   target_link_libraries(test_types ${PROJECT_NAME})
 endif()
