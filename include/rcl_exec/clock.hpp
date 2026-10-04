@@ -12,35 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef RCLCPP__CLOCK_HPP_
-#define RCLCPP__CLOCK_HPP_
+#ifndef RCL_EXEC__CLOCK_HPP_
+#define RCL_EXEC__CLOCK_HPP_
 
 #include <functional>
 #include <memory>
 #include <mutex>
 
-#include "rclcpp/contexts/default_context.hpp"
-#include "rclcpp/macros.hpp"
-#include "rclcpp/time.hpp"
-#include "rclcpp/visibility_control.hpp"
-
+#include "rcl/context.h"
 #include "rcl/time.h"
-#include "rcutils/time.h"
-#include "rcutils/types/rcutils_ret.h"
+#include "rcl/types.h"
 
-namespace rclcpp
+#include "rcl_exec/macros.hpp"
+#include "rcl_exec/visibility_control.hpp"
+
+namespace rcl_exec
 {
-
-class TimeSource;
 
 class JumpHandler
 {
 public:
-  RCLCPP_SMART_PTR_DEFINITIONS(JumpHandler)
+  RCL_EXEC_SMART_PTR_DEFINITIONS(JumpHandler)
 
   using pre_callback_t = std::function<void ()>;
   using post_callback_t = std::function<void (const rcl_time_jump_t &)>;
 
+  RCL_EXEC_PUBLIC
   JumpHandler(
     pre_callback_t pre_callback,
     post_callback_t post_callback,
@@ -54,7 +51,7 @@ public:
 class Clock
 {
 public:
-  RCLCPP_SMART_PTR_DEFINITIONS(Clock)
+  RCL_EXEC_SMART_PTR_DEFINITIONS(Clock)
 
   /// Default c'tor
   /**
@@ -68,23 +65,23 @@ public:
    * TimeSource yourself.
    *
    * \param clock_type type of the clock.
-   * \throws anything rclcpp::exceptions::throw_from_rcl_error can throw.
+   * \throws std::bad_alloc if the clock storage cannot be allocated.
+   * \throws std::invalid_argument if rcl rejects the clock type.
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   explicit Clock(rcl_clock_type_t clock_type = RCL_SYSTEM_TIME);
 
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   ~Clock();
 
   /**
    * Returns current time from the time source specified by clock_type.
    *
-   * \return current time.
-   * \throws anything rclcpp::exceptions::throw_from_rcl_error can throw.
+   * \return current time in nanoseconds; 0, with an error logged, if rcl cannot read the clock.
    */
-  RCLCPP_PUBLIC
-  Time
-  now() const;
+  RCL_EXEC_PUBLIC
+  rcl_time_point_value_t
+  now() const noexcept;
 
   /**
    * Sleep until a specified Time, according to clock type.
@@ -105,20 +102,16 @@ public:
    *    https://gcc.gnu.org/bugzilla/show_bug.cgi?id=41861
    *    https://gcc.gnu.org/bugzilla/show_bug.cgi?id=58931
    *
-   * \param until absolute time according to current clock type to sleep until.
-   * \param context the rclcpp context the clock should use to check that ROS is still initialized.
+   * \param until absolute time in nanoseconds, in this clock's time base, to sleep until.
+   * \param context the rcl context the clock should use to check that ROS is still initialized.
    * \return true immediately if `until` is in the past
    * \return true when the time `until` is reached
    * \return false if time cannot be reached reliably, for example from shutdown or a change
-   *    of time source.
-   * \throws std::runtime_error if the context is invalid
-   * \throws std::runtime_error if `until` has a different clock type from this clock
+   *    of time source, or if `context` is null or invalid.
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   bool
-  sleep_until(
-    const Time & until,
-    const Context::SharedPtr & context = contexts::get_global_default_context());
+  sleep_until(rcl_time_point_value_t until, rcl_context_t * context);
 
   /**
    * Sleep for a specified Duration.
@@ -131,18 +124,24 @@ public:
    *
    * The function will return immediately if `rel_time` is zero or negative.
    *
-   * \param rel_time the length of time to sleep for.
-   * \param context the rclcpp context the clock should use to check that ROS is still initialized.
+   * \param rel_time the length of time to sleep for, in nanoseconds.
+   * \param context the rcl context the clock should use to check that ROS is still initialized.
    * \return true when the end time is reached
    * \return false if time cannot be reached reliably, for example from shutdown or a change
-   *    of time source.
-   * \throws std::runtime_error if the context is invalid
+   *    of time source, or if `context` is null or invalid.
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   bool
-  sleep_for(
-    const Duration & rel_time,
-    const Context::SharedPtr & context = contexts::get_global_default_context());
+  sleep_for(rcl_duration_value_t rel_time, rcl_context_t * context);
+
+  /// Wake every sleep on this clock because the context is shutting down.
+  /**
+   * rcl has no shutdown callback; the client library calls this from its own context
+   * shutdown hook.
+   */
+  RCL_EXEC_PUBLIC
+  void
+  notify_shutdown();
 
   /**
    * Check if the clock is started.
@@ -152,65 +151,62 @@ public:
    * nothing has been published on the clock topic yet.
    *
    * \return true if clock is started
-   * \throws std::runtime_error if the clock is not rcl_clock_valid
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   bool
   started();
 
   /**
    * Wait until clock to start.
    *
-   * \rclcpp::Clock::started
    * \param context the context to wait in
    * \return true if clock was already started or became started
-   * \throws std::runtime_error if the context is invalid or clock is not rcl_clock_valid
+   * \return false if `context` is null or invalid
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   bool
-  wait_until_started(const Context::SharedPtr & context = contexts::get_global_default_context());
+  wait_until_started(rcl_context_t * context);
 
   /**
    * Wait for clock to start, with timeout.
    *
    * The timeout is waited in steady time.
    *
-   * \rclcpp::Clock::started
-   * \param timeout the maximum time to wait for.
+   * \param timeout the maximum time to wait for, in nanoseconds.
    * \param context the context to wait in.
    * \param wait_tick_ns the time to wait between each iteration of the wait loop (in nanoseconds).
    * \return true if clock was or became valid
-   * \throws std::runtime_error if the context is invalid or clock is not rcl_clock_valid
+   * \return false if `context` is null or invalid
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   bool
   wait_until_started(
-    const rclcpp::Duration & timeout,
-    const Context::SharedPtr & context = contexts::get_global_default_context(),
-    const rclcpp::Duration & wait_tick_ns = rclcpp::Duration(0, static_cast<uint32_t>(1e7)));
+    rcl_duration_value_t timeout,
+    rcl_context_t * context,
+    rcl_duration_value_t wait_tick_ns = 10000000);
 
   /**
    * Returns the clock of the type `RCL_ROS_TIME` is active.
    *
-   * \return true if the clock is active
-   * \throws anything rclcpp::exceptions::throw_from_rcl_error can throw if
-   * the current clock does not have the clock_type `RCL_ROS_TIME`.
+   * \param[out] active true if the clock is active
+   * \return `RCL_RET_OK`, or the rcl error if the current clock does not have the
+   * clock_type `RCL_ROS_TIME`; the rcutils error state is left set.
    */
-  RCLCPP_PUBLIC
-  bool
-  ros_time_is_active();
+  RCL_EXEC_PUBLIC
+  rcl_ret_t
+  ros_time_is_active(bool & active);
 
   /// Return the rcl_clock_t clock handle
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   rcl_clock_t *
   get_clock_handle() noexcept;
 
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   rcl_clock_type_t
   get_clock_type() const noexcept;
 
   /// Get the clock's mutex
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   std::mutex &
   get_clock_mutex() noexcept;
 
@@ -230,21 +226,24 @@ public:
    * \param post_callback Must be non-throwing.
    * \param threshold Callbacks will be triggered if the time jump is greater
    * than the threshold.
-   * \throws anything rclcpp::exceptions::throw_from_rcl_error can throw.
+   * \param[out] handler the registered handler; the callback is removed when its last copy
+   * is destroyed.
+   * \return `RCL_RET_OK`, or the rcl error from adding the callback; the rcutils error state
+   * is left set.
    * \throws std::bad_alloc if the allocation of the JumpHandler fails.
    * \warning the instance of the clock must remain valid as long as any created
    * JumpHandler.
    */
-  RCLCPP_PUBLIC
-  JumpHandler::SharedPtr
+  RCL_EXEC_PUBLIC
+  rcl_ret_t
   create_jump_callback(
     const JumpHandler::pre_callback_t & pre_callback,
     const JumpHandler::post_callback_t & post_callback,
-    const rcl_jump_threshold_t & threshold);
+    const rcl_jump_threshold_t & threshold,
+    JumpHandler::SharedPtr & handler);
 
 private:
   // Invoke time jump callback
-  RCLCPP_PUBLIC
   static void
   on_time_jump(
     const rcl_time_jump_t * time_jump,
@@ -259,7 +258,7 @@ private:
 
 /**
  * A synchronization primitive, equal to std::conditional_variable,
- * that works with the rclcpp::Clock.
+ * that works with the rcl_exec::Clock.
  *
  * For more information on the API see https://en.cppreference.com/w/cpp/thread/condition_variable.
  *
@@ -273,12 +272,12 @@ private:
   std::unique_ptr<ClockWaiterImpl> impl_;
 
 public:
-  RCLCPP_SMART_PTR_DEFINITIONS(ClockWaiter)
+  RCL_EXEC_SMART_PTR_DEFINITIONS(ClockWaiter)
 
-  RCLCPP_PUBLIC
-  explicit ClockWaiter(const rclcpp::Clock::SharedPtr & clock);
+  RCL_EXEC_PUBLIC
+  explicit ClockWaiter(const Clock::SharedPtr & clock);
 
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   ~ClockWaiter();
 
   /**
@@ -286,23 +285,24 @@ public:
    * or pred returns true.
    * @param lock A locked lock. The lock must be locked at call time, or this method will throw.
    *             The lock will be atomically released and this thread will blocked.
-   * @param abs_time The time until which this thread shall be blocked.
+   * @param abs_time The time, in nanoseconds in the clock's time base, until which this thread
+   *             shall be blocked.
    * @param pred may be called in cased of spurious wakeups, but must be called every time
    *             notify_one() was called. During the call to pred, the given lock will be locked.
    *             This method will return, if pred returns true.
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   bool
   wait_until(
     std::unique_lock<std::mutex> & lock,
-    const rclcpp::Time & abs_time, const std::function<bool ()> & pred);
+    rcl_time_point_value_t abs_time, const std::function<bool ()> & pred);
 
   /**
    * Notify the blocked thread, that it should reevaluate the wakeup condition.
    * The given pred function in wait_until will be reevaluated and wait_until
    * will return if it evaluates to true.
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   void
   notify_one();
 };
@@ -310,11 +310,11 @@ public:
 
 /**
  * A synchronization primitive, similar to std::conditional_variable,
- * that works with the rclcpp::Clock.
+ * that works with the rcl_exec::Clock.
  *
  * For more information on the API see https://en.cppreference.com/w/cpp/thread/condition_variable.
  *
- * This primitive will wake up if the context was shut down.
+ * This primitive will wake up if notify_shutdown() is called.
  */
 class ClockConditionalVariable
 {
@@ -322,13 +322,11 @@ class ClockConditionalVariable
   std::unique_ptr<Impl> impl_;
 
 public:
-  RCLCPP_SMART_PTR_DEFINITIONS(ClockConditionalVariable)
+  RCL_EXEC_SMART_PTR_DEFINITIONS(ClockConditionalVariable)
 
-  RCLCPP_PUBLIC
-  ClockConditionalVariable(
-    const rclcpp::Clock::SharedPtr & clock,
-    const rclcpp::Context::SharedPtr & context = rclcpp::contexts::get_global_default_context());
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
+  explicit ClockConditionalVariable(const Clock::SharedPtr & clock);
+  RCL_EXEC_PUBLIC
   ~ClockConditionalVariable();
 
   /**
@@ -337,37 +335,47 @@ public:
    * @param lock A locked lock. The lock must be locked at call time, or this method will throw.
    *             The lock will be atomically released and this thread will blocked.
    *             The given lock must be created using the mutex returned my mutex().
-   * @param abs_time The time until which this thread shall be blocked.
+   * @param until The time, in nanoseconds in the clock's time base, until which this thread
+   *             shall be blocked.
    * @param pred may be called in cased of spurious wakeups, but must be called every time
    *             notify_one() was called. During the call to pred, the given lock will be locked.
    *             This method will return, if pred returns true.
    *
    * @return true if until was reached.
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   bool
   wait_until(
-    std::unique_lock<std::mutex> & lock, const rclcpp::Time & until,
+    std::unique_lock<std::mutex> & lock, rcl_time_point_value_t until,
     const std::function<bool ()> & pred);
 
   /**
    * Notify the blocked thread, that is should reevaluate the wakeup condition.
    * E.g. the given pred function in wait_until shall be reevaluated.
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   void
   notify_one();
+
+  /**
+   * Wake the blocked thread because the context is shutting down.
+   * rcl has no shutdown callback; the client library calls this from its own context
+   * shutdown hook.
+   */
+  RCL_EXEC_PUBLIC
+  void
+  notify_shutdown();
 
   /**
    * Returns the internal mutex. In order to be race free with the context shutdown,
    * this mutex must be used for the wait_until call.
    */
-  RCLCPP_PUBLIC
+  RCL_EXEC_PUBLIC
   std::mutex &
   mutex();
 };
 
 
-}  // namespace rclcpp
+}  // namespace rcl_exec
 
-#endif  // RCLCPP__CLOCK_HPP_
+#endif  // RCL_EXEC__CLOCK_HPP_

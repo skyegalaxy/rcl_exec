@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "rclcpp/clock.hpp"
+#include "rcl_exec/clock.hpp"
 
+#include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <new>
+#include <stdexcept>
+#include <string>
+#include <utility>
 
-#include "rclcpp/exceptions.hpp"
-#include "rclcpp/utilities.hpp"
-
-#include "rcpputils/scope_exit.hpp"
+#include "rcl/error_handling.h"
 #include "rcutils/logging_macros.h"
 
-namespace rclcpp
+namespace rcl_exec
 {
 
 class Clock::Impl
@@ -33,8 +37,15 @@ public:
   : allocator_{rcl_get_default_allocator()}
   {
     rcl_ret_t ret = rcl_clock_init(clock_type, &rcl_clock_, &allocator_);
+    if (ret == RCL_RET_BAD_ALLOC) {
+      rcl_reset_error();
+      throw std::bad_alloc{};
+    }
     if (ret != RCL_RET_OK) {
-      exceptions::throw_from_rcl_error(ret, "failed to initialize rcl clock");
+      std::string message = std::string("failed to initialize rcl clock: ") +
+        rcl_get_error_string().str;
+      rcl_reset_error();
+      throw std::invalid_argument(message);
     }
   }
 
@@ -48,7 +59,6 @@ public:
 
   rcl_clock_t rcl_clock_;
   rcl_allocator_t allocator_;
-  bool stop_sleeping_ = false;
   bool shutdown_ = false;
   std::condition_variable cv_;
   std::mutex wait_mutex_;
@@ -69,74 +79,54 @@ Clock::Clock(rcl_clock_type_t clock_type)
 
 Clock::~Clock() {}
 
-Time
-Clock::now() const
+rcl_time_point_value_t
+Clock::now() const noexcept
 {
-  Time now(0, 0, impl_->rcl_clock_.type);
+  rcl_time_point_value_t now = 0;
 
-  auto ret = rcl_clock_get_now(&impl_->rcl_clock_, &now.rcl_time_.nanoseconds);
+  auto ret = rcl_clock_get_now(&impl_->rcl_clock_, &now);
   if (ret != RCL_RET_OK) {
-    exceptions::throw_from_rcl_error(ret, "could not get current time stamp");
+    RCUTILS_LOG_ERROR("could not get current time stamp: %s", rcl_get_error_string().str);
+    rcl_reset_error();
+    return 0;
   }
 
   return now;
 }
 
 bool
-Clock::sleep_until(
-  const Time & until,
-  const Context::SharedPtr & context)
+Clock::sleep_until(rcl_time_point_value_t until, rcl_context_t * context)
 {
-  if (!context || !context->is_valid()) {
-    throw std::runtime_error("context cannot be slept with because it's invalid");
+  if (!context || !rcl_context_is_valid(context)) {
+    return false;
   }
   const auto this_clock_type = get_clock_type();
-  if (until.get_clock_type() != this_clock_type) {
-    throw std::runtime_error("until's clock type does not match this clock's type");
-  }
   bool time_source_changed = false;
-
-  // Wake this thread if the context is shutdown
-  rclcpp::OnShutdownCallbackHandle shutdown_cb_handle = context->add_on_shutdown_callback(
-    [this]() {
-      {
-        std::unique_lock lock(impl_->wait_mutex_);
-        impl_->shutdown_ = true;
-      }
-      impl_->cv_.notify_one();
-    });
-  // No longer need the shutdown callback when this function exits
-  auto callback_remover = rcpputils::scope_exit(
-    [context, &shutdown_cb_handle]() {
-      context->remove_on_shutdown_callback(shutdown_cb_handle);
-    });
 
   if (this_clock_type == RCL_STEADY_TIME) {
     // Synchronize because RCL steady clock epoch might differ from chrono::steady_clock epoch
-    const Time rcl_entry = now();
+    const rcl_time_point_value_t rcl_entry = now();
     const std::chrono::steady_clock::time_point chrono_entry = std::chrono::steady_clock::now();
-    const Duration delta_t = until - rcl_entry;
+    const rcl_duration_value_t delta_t = until - rcl_entry;
     const std::chrono::steady_clock::time_point chrono_until =
-      chrono_entry + std::chrono::nanoseconds(delta_t.nanoseconds());
+      chrono_entry + std::chrono::nanoseconds(delta_t);
 
-    // loop over spurious wakeups but notice shutdown or stop of sleep
+    // loop over spurious wakeups but notice shutdown
     std::unique_lock lock(impl_->wait_mutex_);
-    while (now() < until && !impl_->stop_sleeping_ && !impl_->shutdown_ && context->is_valid()) {
+    while (now() < until && !impl_->shutdown_ && rcl_context_is_valid(context)) {
       impl_->cv_.wait_until(lock, chrono_until);
     }
-    impl_->stop_sleeping_ = false;
   } else if (this_clock_type == RCL_SYSTEM_TIME) {
     auto system_time = std::chrono::system_clock::time_point(
       // Cast because system clock resolution is too big for nanoseconds on some systems
       std::chrono::duration_cast<std::chrono::system_clock::duration>(
-        std::chrono::nanoseconds(until.nanoseconds())));
+        std::chrono::nanoseconds(until)));
 
-    // loop over spurious wakeups but notice shutdown or stop of sleep
+    // loop over spurious wakeups but notice shutdown
     std::unique_lock lock(impl_->wait_mutex_);
-    while (now() < until && !impl_->stop_sleeping_ && !impl_->shutdown_ && context->is_valid()) {
+    while (now() < until && !impl_->shutdown_ && rcl_context_is_valid(context)) {
       impl_->cv_.wait_until(lock, system_time);
     }
-    impl_->stop_sleeping_ = false;
   } else if (this_clock_type == RCL_ROS_TIME) {
     // Install jump handler for any amount of time change, for two purposes:
     // - if ROS time is active, check if time reached on each new clock sample
@@ -146,7 +136,8 @@ Clock::sleep_until(
     // 0 is disable, so -1 and 1 are smallest possible time changes
     threshold.min_backward.nanoseconds = -1;
     threshold.min_forward.nanoseconds = 1;
-    auto clock_handler = create_jump_callback(
+    JumpHandler::SharedPtr clock_handler;
+    rcl_ret_t ret = create_jump_callback(
       nullptr,
       [this, &time_source_changed](const rcl_time_jump_t & jump) {
         if (jump.clock_change != RCL_ROS_TIME_NO_CHANGE) {
@@ -155,37 +146,44 @@ Clock::sleep_until(
         }
         impl_->cv_.notify_one();
       },
-      threshold);
+      threshold, clock_handler);
+    if (ret != RCL_RET_OK) {
+      RCUTILS_LOG_ERROR("Failed to add time jump callback: %s", rcl_get_error_string().str);
+      rcl_reset_error();
+      return false;
+    }
 
-    if (!ros_time_is_active()) {
+    bool ros_time_active = false;
+    if (ros_time_is_active(ros_time_active) != RCL_RET_OK) {
+      rcl_reset_error();
+    }
+    if (!ros_time_active) {
       auto system_time = std::chrono::system_clock::time_point(
         // Cast because system clock resolution is too big for nanoseconds on some systems
         std::chrono::duration_cast<std::chrono::system_clock::duration>(
-          std::chrono::nanoseconds(until.nanoseconds())));
+          std::chrono::nanoseconds(until)));
 
-      // loop over spurious wakeups but notice shutdown, stop of sleep or time source change
+      // loop over spurious wakeups but notice shutdown or time source change
       std::unique_lock lock(impl_->wait_mutex_);
-      while (now() < until && !impl_->stop_sleeping_ && !impl_->shutdown_ && context->is_valid() &&
+      while (now() < until && !impl_->shutdown_ && rcl_context_is_valid(context) &&
         !time_source_changed)
       {
         impl_->cv_.wait_until(lock, system_time);
       }
-      impl_->stop_sleeping_ = false;
     } else {
       // RCL_ROS_TIME with ros_time_is_active.
       // Just wait without "until" because installed
       // jump callbacks wake the cv on every new sample.
       std::unique_lock lock(impl_->wait_mutex_);
-      while (now() < until && !impl_->stop_sleeping_ && !impl_->shutdown_ && context->is_valid() &&
+      while (now() < until && !impl_->shutdown_ && rcl_context_is_valid(context) &&
         !time_source_changed)
       {
         impl_->cv_.wait(lock);
       }
-      impl_->stop_sleeping_ = false;
     }
   }
 
-  if (!context->is_valid() || time_source_changed) {
+  if (!rcl_context_is_valid(context) || time_source_changed) {
     return false;
   }
 
@@ -193,65 +191,66 @@ Clock::sleep_until(
 }
 
 bool
-Clock::sleep_for(const Duration & rel_time, const Context::SharedPtr & context)
+Clock::sleep_for(rcl_duration_value_t rel_time, rcl_context_t * context)
 {
   return sleep_until(now() + rel_time, context);
+}
+
+void
+Clock::notify_shutdown()
+{
+  {
+    std::unique_lock lock(impl_->wait_mutex_);
+    impl_->shutdown_ = true;
+  }
+  impl_->cv_.notify_one();
 }
 
 bool
 Clock::started()
 {
-  if (!rcl_clock_valid(get_clock_handle())) {
-    throw std::runtime_error("clock is not rcl_clock_valid");
-  }
   return rcl_clock_time_started(get_clock_handle());
 }
 
 bool
-Clock::wait_until_started(const Context::SharedPtr & context)
+Clock::wait_until_started(rcl_context_t * context)
 {
-  if (!context || !context->is_valid()) {
-    throw std::runtime_error("context cannot be slept with because it's invalid");
-  }
-  if (!rcl_clock_valid(get_clock_handle())) {
-    throw std::runtime_error("clock cannot be waited on as it is not rcl_clock_valid");
+  if (!context || !rcl_context_is_valid(context)) {
+    return false;
   }
 
   if (started()) {
     return true;
   } else {
     // Wait until the first non-zero time
-    return sleep_until(rclcpp::Time(0, 1, get_clock_type()), context);
+    return sleep_until(1, context);
   }
 }
 
 bool
 Clock::wait_until_started(
-  const Duration & timeout,
-  const Context::SharedPtr & context,
-  const Duration & wait_tick_ns)
+  rcl_duration_value_t timeout,
+  rcl_context_t * context,
+  rcl_duration_value_t wait_tick_ns)
 {
-  if (!context || !context->is_valid()) {
-    throw std::runtime_error("context cannot be slept with because it's invalid");
-  }
-  if (!rcl_clock_valid(get_clock_handle())) {
-    throw std::runtime_error("clock cannot be waited on as it is not rcl_clock_valid");
+  if (!context || !rcl_context_is_valid(context)) {
+    return false;
   }
 
   Clock timeout_clock = Clock(RCL_STEADY_TIME);
-  Time start = timeout_clock.now();
+  rcl_time_point_value_t start = timeout_clock.now();
 
   // Check if the clock has started every wait_tick_ns nanoseconds
-  // Context check checks for rclcpp::shutdown()
-  while (!started() && context->is_valid()) {
+  // Context check checks for shutdown
+  while (!started() && rcl_context_is_valid(context)) {
     if (timeout < wait_tick_ns) {
-      timeout_clock.sleep_for(timeout);
+      timeout_clock.sleep_for(timeout, context);
     } else {
-      Duration time_left = start + timeout - timeout_clock.now();
+      rcl_duration_value_t time_left = start + timeout - timeout_clock.now();
       if (time_left > wait_tick_ns) {
-        timeout_clock.sleep_for(Duration(wait_tick_ns));
+        timeout_clock.sleep_for(wait_tick_ns, context);
       } else {
-        timeout_clock.sleep_for(time_left);
+        timeout_clock.sleep_for(time_left, context);
       }
     }
 
@@ -263,21 +262,16 @@ Clock::wait_until_started(
 }
 
 
-bool
-Clock::ros_time_is_active()
+rcl_ret_t
+Clock::ros_time_is_active(bool & active)
 {
+  active = false;
   if (!rcl_clock_valid(&impl_->rcl_clock_)) {
     RCUTILS_LOG_ERROR("ROS time not valid!");
-    return false;
+    return RCL_RET_OK;
   }
 
-  bool is_enabled = false;
-  auto ret = rcl_is_enabled_ros_time_override(&impl_->rcl_clock_, &is_enabled);
-  if (ret != RCL_RET_OK) {
-    exceptions::throw_from_rcl_error(
-      ret, "Failed to check ros_time_override_status");
-  }
-  return is_enabled;
+  return rcl_is_enabled_ros_time_override(&impl_->rcl_clock_, &active);
 }
 
 rcl_clock_t *
@@ -315,11 +309,12 @@ Clock::on_time_jump(
   }
 }
 
-JumpHandler::SharedPtr
+rcl_ret_t
 Clock::create_jump_callback(
   const JumpHandler::pre_callback_t & pre_callback,
   const JumpHandler::post_callback_t & post_callback,
-  const rcl_jump_threshold_t & threshold)
+  const rcl_jump_threshold_t & threshold,
+  JumpHandler::SharedPtr & jump_handler)
 {
   // Allocate a new jump handler
   JumpHandler::UniquePtr handler(new JumpHandler(pre_callback, post_callback, threshold));
@@ -334,14 +329,15 @@ Clock::create_jump_callback(
       &impl_->rcl_clock_, threshold, Clock::on_time_jump,
       handler.get());
     if (RCL_RET_OK != ret) {
-      exceptions::throw_from_rcl_error(ret, "Failed to add time jump callback");
+      return ret;
     }
   }
 
   std::weak_ptr<Clock::Impl> weak_impl = impl_;
   // *INDENT-OFF*
   // create shared_ptr that removes the callback automatically when all copies are destructed
-  return JumpHandler::SharedPtr(handler.release(), [weak_impl](JumpHandler * handler) noexcept {
+  jump_handler = JumpHandler::SharedPtr(handler.release(),
+    [weak_impl](JumpHandler * handler) noexcept {
     auto shared_impl = weak_impl.lock();
     if (shared_impl) {
       std::lock_guard<std::mutex> clock_guard(shared_impl->clock_mutex_);
@@ -354,6 +350,7 @@ Clock::create_jump_callback(
     delete handler;
   });
   // *INDENT-ON*
+  return RCL_RET_OK;
 }
 
 class ClockWaiter::ClockWaiterImpl
@@ -361,19 +358,19 @@ class ClockWaiter::ClockWaiterImpl
 private:
   std::condition_variable cv_;
 
-  rclcpp::Clock::SharedPtr clock_;
+  Clock::SharedPtr clock_;
   bool time_source_changed_ = false;
   std::function<void(const rcl_time_jump_t &)> post_time_jump_callback;
 
   bool
   wait_until_system_time(
     std::unique_lock<std::mutex> & lock,
-    const rclcpp::Time & abs_time, const std::function<bool ()> & pred)
+    rcl_time_point_value_t abs_time, const std::function<bool ()> & pred)
   {
     auto system_time = std::chrono::system_clock::time_point(
     // Cast because system clock resolution is too big for nanoseconds on some systems
     std::chrono::duration_cast<std::chrono::system_clock::duration>(
-        std::chrono::nanoseconds(abs_time.nanoseconds())));
+        std::chrono::nanoseconds(abs_time)));
 
     return cv_.wait_until(lock, system_time, pred);
   }
@@ -381,14 +378,14 @@ private:
   bool
   wait_until_steady_time(
     std::unique_lock<std::mutex> & lock,
-    const rclcpp::Time & abs_time, const std::function<bool ()> & pred)
+    rcl_time_point_value_t abs_time, const std::function<bool ()> & pred)
   {
     // Synchronize because RCL steady clock epoch might differ from chrono::steady_clock epoch
-    const rclcpp::Time rcl_entry = clock_->now();
+    const rcl_time_point_value_t rcl_entry = clock_->now();
     const std::chrono::steady_clock::time_point chrono_entry = std::chrono::steady_clock::now();
-    const rclcpp::Duration delta_t = abs_time - rcl_entry;
+    const rcl_duration_value_t delta_t = abs_time - rcl_entry;
     const std::chrono::steady_clock::time_point chrono_until =
-      chrono_entry + std::chrono::nanoseconds(delta_t.nanoseconds());
+      chrono_entry + std::chrono::nanoseconds(delta_t);
 
     return cv_.wait_until(lock, chrono_until, pred);
   }
@@ -397,7 +394,7 @@ private:
   bool
   wait_until_ros_time(
     std::unique_lock<std::mutex> & lock,
-    const rclcpp::Time & abs_time, const std::function<bool ()> & pred)
+    rcl_time_point_value_t abs_time, const std::function<bool ()> & pred)
   {
     // Install jump handler for any amount of time change, for two purposes:
     // - if ROS time is active, check if time reached on each new clock sample
@@ -424,16 +421,26 @@ private:
     // its more overhead to have the callback being called all the time.
     // As we expect the use case to be low frequency calls to wait_until
     // with relative big pauses between the calls, we install it on demand.
-    auto clock_handler = clock_->create_jump_callback(
-      nullptr,
-      post_time_jump_callback,
-      threshold);
+    JumpHandler::SharedPtr clock_handler;
+    if (clock_->create_jump_callback(
+        nullptr,
+        post_time_jump_callback,
+        threshold, clock_handler) != RCL_RET_OK)
+    {
+      RCUTILS_LOG_ERROR("Failed to add time jump callback: %s", rcl_get_error_string().str);
+      rcl_reset_error();
+      return false;
+    }
 
-    if (!clock_->ros_time_is_active()) {
+    bool ros_time_active = false;
+    if (clock_->ros_time_is_active(ros_time_active) != RCL_RET_OK) {
+      rcl_reset_error();
+    }
+    if (!ros_time_active) {
       auto system_time = std::chrono::system_clock::time_point(
         // Cast because system clock resolution is too big for nanoseconds on some systems
         std::chrono::duration_cast<std::chrono::system_clock::duration>(
-          std::chrono::nanoseconds(abs_time.nanoseconds())));
+          std::chrono::nanoseconds(abs_time)));
 
       return cv_.wait_until(lock, system_time, [this, &pred] () {
                  return time_source_changed_ || pred();
@@ -451,7 +458,7 @@ private:
   }
 
 public:
-  explicit ClockWaiterImpl(const rclcpp::Clock::SharedPtr & clock)
+  explicit ClockWaiterImpl(const Clock::SharedPtr & clock)
   :clock_(clock)
   {
   }
@@ -459,11 +466,11 @@ public:
   bool
   wait_until(
     std::unique_lock<std::mutex> & lock,
-    const rclcpp::Time & abs_time, const std::function<bool ()> & pred)
+    rcl_time_point_value_t abs_time, const std::function<bool ()> & pred)
   {
     switch(clock_->get_clock_type()) {
       case RCL_CLOCK_UNINITIALIZED:
-        throw std::runtime_error("Error, wait on uninitialized clock called");
+        return false;
       case RCL_ROS_TIME:
         return wait_until_ros_time(lock, abs_time, pred);
         break;
@@ -485,7 +492,7 @@ public:
   }
 };
 
-ClockWaiter::ClockWaiter(const rclcpp::Clock::SharedPtr & clock)
+ClockWaiter::ClockWaiter(const Clock::SharedPtr & clock)
 :impl_(std::make_unique<ClockWaiterImpl>(clock))
 {
 }
@@ -495,7 +502,7 @@ ClockWaiter::~ClockWaiter() = default;
 bool
 ClockWaiter::wait_until(
   std::unique_lock<std::mutex> & lock,
-  const rclcpp::Time & abs_time, const std::function<bool ()> & pred)
+  rcl_time_point_value_t abs_time, const std::function<bool ()> & pred)
 {
   return impl_->wait_until(lock, abs_time, pred);
 }
@@ -510,37 +517,17 @@ class ClockConditionalVariable::Impl
 {
   std::mutex pred_mutex_;
   bool shutdown_ = false;
-  rclcpp::Context::SharedPtr context_;
-  rclcpp::OnShutdownCallbackHandle shutdown_cb_handle_;
   ClockWaiter::UniquePtr clock_;
 
 public:
-  Impl(const rclcpp::Clock::SharedPtr & clock, const rclcpp::Context::SharedPtr & context)
-  :context_(context),
-    clock_(std::make_unique<ClockWaiter>(clock))
+  explicit Impl(const Clock::SharedPtr & clock)
+  : clock_(std::make_unique<ClockWaiter>(clock))
   {
-    if (!context_ || !context_->is_valid()) {
-      throw std::runtime_error("context cannot be slept with because it's invalid");
-    }
-    // Wake this thread if the context is shutdown
-    shutdown_cb_handle_ = context_->add_on_shutdown_callback(
-      [this]() {
-        {
-          std::unique_lock lock(pred_mutex_);
-          shutdown_ = true;
-        }
-        clock_->notify_one();
-    });
-  }
-
-  ~Impl()
-  {
-    context_->remove_on_shutdown_callback(shutdown_cb_handle_);
   }
 
   bool
   wait_until(
-    std::unique_lock<std::mutex> & lock, const rclcpp::Time & until,
+    std::unique_lock<std::mutex> & lock, rcl_time_point_value_t until,
     const std::function<bool ()> & pred)
   {
     if(lock.mutex() != &pred_mutex_) {
@@ -561,6 +548,16 @@ public:
     clock_->notify_one();
   }
 
+  void
+  notify_shutdown()
+  {
+    {
+      std::unique_lock lock(pred_mutex_);
+      shutdown_ = true;
+    }
+    clock_->notify_one();
+  }
+
   std::mutex &
   mutex()
   {
@@ -568,10 +565,8 @@ public:
   }
 };
 
-ClockConditionalVariable::ClockConditionalVariable(
-  const rclcpp::Clock::SharedPtr & clock,
-  const rclcpp::Context::SharedPtr & context)
-:impl_(std::make_unique<Impl>(clock, context))
+ClockConditionalVariable::ClockConditionalVariable(const Clock::SharedPtr & clock)
+:impl_(std::make_unique<Impl>(clock))
 {
 }
 
@@ -583,9 +578,15 @@ ClockConditionalVariable::notify_one()
   impl_->notify_one();
 }
 
+void
+ClockConditionalVariable::notify_shutdown()
+{
+  impl_->notify_shutdown();
+}
+
 bool
 ClockConditionalVariable::wait_until(
-  std::unique_lock<std::mutex> & lock, const rclcpp::Time & until,
+  std::unique_lock<std::mutex> & lock, rcl_time_point_value_t until,
   const std::function<bool ()> & pred)
 {
   return impl_->wait_until(lock, until, pred);
@@ -597,4 +598,4 @@ ClockConditionalVariable::mutex()
   return impl_->mutex();
 }
 
-}  // namespace rclcpp
+}  // namespace rcl_exec

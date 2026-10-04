@@ -5,6 +5,7 @@ project(rcl_exec)
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_ros_core REQUIRED)
 find_package(rcl REQUIRED)
+find_package(rcutils REQUIRED)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wconversion -Wno-sign-conversion -Wpedantic
@@ -12,6 +13,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 add_library(${PROJECT_NAME}
+  src/rcl_exec/clock.cpp
   src/rcl_exec/detail/first_in_first_out_scheduler.cpp
   src/rcl_exec/detail/global_event_id_provider.cpp)
 target_include_directories(${PROJECT_NAME}
@@ -22,8 +24,12 @@ target_include_directories(${PROJECT_NAME}
   "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(${PROJECT_NAME} PUBLIC
   rcl::rcl
+  rcutils::rcutils
   # Exports the ROS C++ standard as the minimum for consumers.
   ament_cmake_ros_core::ament_ros_defaults)
+# Causes the visibility macros to use dllexport rather than dllimport,
+# which is appropriate when building the dll but not consuming it.
+target_compile_definitions(${PROJECT_NAME} PRIVATE "RCL_EXEC_BUILDING_LIBRARY")
 
 install(
   DIRECTORY include/
@@ -37,7 +43,7 @@ install(
 ament_export_include_directories("include/${PROJECT_NAME}")
 ament_export_libraries(${PROJECT_NAME})
 ament_export_targets(${PROJECT_NAME})
-ament_export_dependencies(ament_cmake_ros_core rcl)
+ament_export_dependencies(ament_cmake_ros_core rcl rcutils)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
