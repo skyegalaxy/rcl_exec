@@ -20,24 +20,31 @@
 #include <mutex>
 #include <thread>
 
-#include "rcl/error_handling.h"
 #include "rcl/time.h"
-#include "rclcpp/clock.hpp"
-#include "rclcpp/node.hpp"
-#include "rclcpp/time_source.hpp"
-#include "rclcpp/utilities.hpp"
-
-#include "../utils/rclcpp_gtest_macros.hpp"
+#include "rcl_exec/clock.hpp"
+#include "rcutils/time.h"
 
 using namespace std::chrono_literals;
+
+namespace
+{
+
+// What rclcpp::TimeSource does when use_sim_time is set.
+void enable_ros_time_override(rcl_exec::Clock & clock)
+{
+  std::lock_guard<std::mutex> clock_guard(clock.get_clock_mutex());
+  ASSERT_EQ(RCL_RET_OK, rcl_enable_ros_time_override(clock.get_clock_handle()));
+}
+
+}  // namespace
 
 class TestClockWakeup : public ::testing::TestWithParam<rcl_clock_type_e>
 {
 public:
-  void test_wakeup_before_sleep(const rclcpp::Clock::SharedPtr & clock)
+  void test_wakeup_before_sleep(const rcl_exec::Clock::SharedPtr & clock)
   {
     std::atomic_bool thread_finished = false;
-    rclcpp::ClockConditionalVariable cond(clock);
+    rcl_exec::ClockConditionalVariable cond(clock);
 
     bool stopSleeping = false;
 
@@ -47,7 +54,7 @@ public:
         // make sure the thread starts sleeping late
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         std::unique_lock lk(cond.mutex());
-        cond.wait_until(lk, clock->now() + std::chrono::seconds(3),
+        cond.wait_until(lk, clock->now() + RCUTILS_S_TO_NS(3),
         [&stopSleeping] () {return stopSleeping;});
         thread_finished = true;
       });
@@ -73,10 +80,10 @@ public:
     EXPECT_LT(cur_time, start_time + std::chrono::seconds(1));
   }
 
-  void test_wakeup_after_sleep(const rclcpp::Clock::SharedPtr & clock)
+  void test_wakeup_after_sleep(const rcl_exec::Clock::SharedPtr & clock)
   {
     std::atomic_bool thread_finished = false;
-    rclcpp::ClockConditionalVariable cond(clock);
+    rcl_exec::ClockConditionalVariable cond(clock);
 
     bool stopSleeping = false;
 
@@ -84,7 +91,7 @@ public:
       [&cond, &clock, &stopSleeping, &thread_finished]()
       {
         std::unique_lock lk(cond.mutex());
-        cond.wait_until(lk, clock->now() + std::chrono::seconds(3),
+        cond.wait_until(lk, clock->now() + RCUTILS_S_TO_NS(3),
         [&stopSleeping] () {return stopSleeping;});
         thread_finished = true;
       });
@@ -112,29 +119,6 @@ public:
     EXPECT_TRUE(thread_finished);
     EXPECT_LT(cur_time, start_time + std::chrono::seconds(1));
   }
-
-protected:
-  static void SetUpTestCase()
-  {
-    rclcpp::init(0, nullptr);
-  }
-
-  static void TearDownTestCase()
-  {
-    rclcpp::shutdown();
-  }
-
-  void SetUp()
-  {
-    node = std::make_shared<rclcpp::Node>("my_node");
-  }
-
-  void TearDown()
-  {
-    node.reset();
-  }
-
-  rclcpp::Node::SharedPtr node;
 };
 
 INSTANTIATE_TEST_SUITE_P(
@@ -145,34 +129,35 @@ INSTANTIATE_TEST_SUITE_P(
 ));
 
 TEST_P(TestClockWakeup, wakeup_sleep) {
-  auto clock = std::make_shared<rclcpp::Clock>(GetParam());
+  auto clock = std::make_shared<rcl_exec::Clock>(GetParam());
   test_wakeup_after_sleep(clock);
   test_wakeup_before_sleep(clock);
 }
 
 TEST_F(TestClockWakeup, wakeup_sleep_ros_time_active) {
-  node->set_parameter({"use_sim_time", true});
-  auto clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
-  rclcpp::TimeSource time_source(node);
-  time_source.attachClock(clock);
+  auto clock = std::make_shared<rcl_exec::Clock>(RCL_ROS_TIME);
+  enable_ros_time_override(*clock);
 
-  EXPECT_TRUE(clock->ros_time_is_active());
+  bool ros_time_active = false;
+  EXPECT_EQ(RCL_RET_OK, clock->ros_time_is_active(ros_time_active));
+  EXPECT_TRUE(ros_time_active);
 
   test_wakeup_after_sleep(clock);
   test_wakeup_before_sleep(clock);
 }
 
 TEST_F(TestClockWakeup, no_wakeup_on_sim_time) {
-  node->set_parameter({"use_sim_time", true});
-  auto clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
-  EXPECT_FALSE(clock->ros_time_is_active());
+  auto clock = std::make_shared<rcl_exec::Clock>(RCL_ROS_TIME);
+  bool ros_time_active = true;
+  EXPECT_EQ(RCL_RET_OK, clock->ros_time_is_active(ros_time_active));
+  EXPECT_FALSE(ros_time_active);
 
-  rclcpp::TimeSource time_source(node);
-  time_source.attachClock(clock);
-  EXPECT_TRUE(clock->ros_time_is_active());
+  enable_ros_time_override(*clock);
+  EXPECT_EQ(RCL_RET_OK, clock->ros_time_is_active(ros_time_active));
+  EXPECT_TRUE(ros_time_active);
 
   std::atomic_bool thread_finished = false;
-  rclcpp::ClockConditionalVariable cond(clock);
+  rcl_exec::ClockConditionalVariable cond(clock);
 
   bool stopSleeping = false;
 
@@ -181,7 +166,7 @@ TEST_F(TestClockWakeup, no_wakeup_on_sim_time) {
     {
       std::unique_lock lk(cond.mutex());
       // only sleep for an short period
-      cond.wait_until(lk, clock->now() + std::chrono::milliseconds(10),
+      cond.wait_until(lk, clock->now() + RCUTILS_MS_TO_NS(10),
       [&stopSleeping] () {return stopSleeping;});
       thread_finished = true;
     });
@@ -212,10 +197,10 @@ TEST_F(TestClockWakeup, no_wakeup_on_sim_time) {
 }
 
 TEST_F(TestClockWakeup, wakeup_on_ros_shutdown) {
-  auto clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
+  auto clock = std::make_shared<rcl_exec::Clock>(RCL_ROS_TIME);
 
   std::atomic_bool thread_finished = false;
-  rclcpp::ClockConditionalVariable cond(clock);
+  rcl_exec::ClockConditionalVariable cond(clock);
 
   bool stopSleeping = false;
 
@@ -224,7 +209,7 @@ TEST_F(TestClockWakeup, wakeup_on_ros_shutdown) {
     {
       std::unique_lock lk(cond.mutex());
       // only sleep for an short period
-      cond.wait_until(lk, clock->now() + std::chrono::seconds(10),
+      cond.wait_until(lk, clock->now() + RCUTILS_S_TO_NS(10),
       [&stopSleeping] () {return stopSleeping;});
       thread_finished = true;
     });
@@ -234,7 +219,8 @@ TEST_F(TestClockWakeup, wakeup_on_ros_shutdown) {
 
   EXPECT_FALSE(thread_finished);
 
-  rclcpp::shutdown();
+  // What rclcpp's context on-shutdown hook does.
+  cond.notify_shutdown();
 
   auto start_time = std::chrono::steady_clock::now();
   auto cur_time = start_time;

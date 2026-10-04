@@ -51,6 +51,12 @@ if(BUILD_TESTING)
 
   find_package(ament_cmake_gtest REQUIRED)
 
+  ament_add_gtest(test_clock test/test_clock.cpp)
+  target_link_libraries(test_clock ${PROJECT_NAME})
+
+  ament_add_gtest(test_clock_conditional test/test_clock_conditional.cpp)
+  target_link_libraries(test_clock_conditional ${PROJECT_NAME})
+
   ament_add_gtest(test_entity_dispatcher test/test_entity_dispatcher.cpp)
   target_link_libraries(test_entity_dispatcher ${PROJECT_NAME})
 
